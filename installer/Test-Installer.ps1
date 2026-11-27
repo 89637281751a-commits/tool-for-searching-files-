@@ -11,7 +11,8 @@ $exe = Join-Path $installFolder 'QuickFind.exe'
 $index = Join-Path $installFolder 'index.txt'
 $shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'QuickFind.lnk'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+$userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$userProducts = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Installer\UserData\$userSid\Products"
 
 function Invoke-Installer($operation, $package, $logName, $expectedExitCode = 0) {
     $log = Join-Path $logFolder "$logName.log"
@@ -24,8 +25,8 @@ function Invoke-Installer($operation, $package, $logName, $expectedExitCode = 0)
 }
 
 function Get-QuickFindRegistrations {
-    Get-ChildItem $uninstallKey -ErrorAction SilentlyContinue | ForEach-Object {
-        Get-ItemProperty $_.PSPath
+    Get-ChildItem $userProducts -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-ItemProperty (Join-Path $_.PSPath 'InstallProperties') -ErrorAction SilentlyContinue
     } | Where-Object { $_.DisplayName -eq 'QuickFind' }
 }
 
@@ -39,7 +40,8 @@ function Assert-Installed([version] $expectedVersion) {
     if ($shell.CreateShortcut($shortcut).TargetPath -ne $exe) { throw 'Incorrect shortcut target.' }
     $product = @(Get-QuickFindRegistrations)
     if ($product.Count -ne 1 -or [version]$product[0].DisplayVersion -ne [version]($expectedVersion.ToString(3))) {
-        throw 'Expected one QuickFind entry in Installed apps at the current version.'
+        $found = ($product | ForEach-Object { $_.DisplayVersion }) -join ', '
+        throw "Expected one QuickFind product at $($expectedVersion.ToString(3)), found $($product.Count): $found"
     }
     if (Get-Process QuickFind -ErrorAction SilentlyContinue) { throw 'Setup started QuickFind.' }
     if ((Get-Content $index -Raw) -ne 'preserve this index') { throw 'Setup changed the index.' }
