@@ -25,7 +25,6 @@ static class Program {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             using (var ui = new Finder()) {
-                if (args.Contains("/setup")) ui.SetStartup(true);
                 ui.Start(!args.Contains("/background"));
                 Application.Run();
             }

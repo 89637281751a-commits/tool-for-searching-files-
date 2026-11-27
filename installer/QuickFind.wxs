@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="$(var.ProductCode)"
+           Name="QuickFind"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="QuickFind"
+           UpgradeCode="6e6acdcb-46c3-4f7e-bb7b-21f70e4210e1">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" />
+    <Upgrade Id="6e6acdcb-46c3-4f7e-bb7b-21f70e4210e1">
+      <UpgradeVersion Maximum="$(var.Version)" IncludeMaximum="no" MigrateFeatures="yes"
+                      Property="QUICKFIND_UPGRADE" />
+      <UpgradeVersion Minimum="$(var.Version)" IncludeMinimum="no" OnlyDetect="yes"
+                      Property="QUICKFIND_NEWER" />
+    </Upgrade>
+    <Condition Message="A newer version of QuickFind is already installed.">Installed OR NOT QUICKFIND_NEWER</Condition>
+    <InstallExecuteSequence>
+      <RemoveExistingProducts After="InstallInitialize" />
+    </InstallExecuteSequence>
+    <Icon Id="QuickFindIcon" SourceFile="QuickFind.ico" />
+    <Property Id="ARPPRODUCTICON" Value="QuickFindIcon" />
+    <Media Id="1" Cabinet="QuickFind.cab" EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="INSTALLFOLDER" Name="QuickFind">
+          <Component Id="QuickFindFiles" Guid="c69a2a65-51f8-4930-988e-a6f3b36fb5d8">
+            <File Id="QuickFindExecutable" Name="QuickFind.exe" Source="$(var.SourceDir)/QuickFind.exe"
+                  DefaultVersion="$(var.Version).0" />
+            <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="QuickFind"
+                      Target="[#QuickFindExecutable]" WorkingDirectory="INSTALLFOLDER" />
+            <RegistryValue Root="HKCU" Key="Software\QuickFind" Name="Installed"
+                           Type="integer" Value="1" KeyPath="yes" />
+            <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+    </Directory>
+
+    <Feature Id="QuickFind" Title="QuickFind" Level="1">
+      <ComponentRef Id="QuickFindFiles" />
+    </Feature>
+  </Product>
+</Wix>
