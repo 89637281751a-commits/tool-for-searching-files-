@@ -1,8 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -14,11 +14,14 @@ using Microsoft.Win32;
 
 static class Program {
     internal static readonly string Home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QuickFind");
+    [DllImport("user32.dll")]
+    static extern bool SetProcessDPIAware();
     [STAThread] static void Main(string[] args) {
         bool first;
         using (var single = new Mutex(true, @"Local\QuickFind.Desktop.2026", out first)) {
             if (!first) return;
             Directory.CreateDirectory(Home);
+            if (Environment.OSVersion.Platform == PlatformID.Win32NT) SetProcessDPIAware();
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             using (var ui = new Finder()) {
@@ -32,11 +35,71 @@ static class Program {
     internal static bool FileError(Exception e) {
         return e is IOException || e is UnauthorizedAccessException || e is System.Security.SecurityException || e is ArgumentException || e is NotSupportedException;
     }
+    internal static uint GetFixedDrives() {
+        uint drives = 0;
+        foreach (var drive in DriveInfo.GetDrives()) {
+            int letter = Char.ToUpperInvariant(drive.Name[0]) - 'A';
+            if (letter >= 0 && letter < 26 && drive.DriveType == DriveType.Fixed) drives |= 1u << letter;
+        }
+        return drives;
+    }
+    internal static bool IsFixedPath(string path, uint drives) {
+        if (String.IsNullOrEmpty(path) || path.Length < 4 || path[1] != ':' || path[2] != '\\') return false;
+        char drive = path[0];
+        int letter = drive >= 'a' && drive <= 'z' ? drive - 'a' : drive - 'A';
+        if (letter < 0 || letter >= 26 || (drives & (1u << letter)) == 0) return false;
+        int componentStart = 3;
+        for (int i = 3; i <= path.Length; i++) {
+            if (i == path.Length || path[i] == '\\') {
+                if (i == componentStart || path[i - 1] == '.' || path[i - 1] == ' ') return false;
+                componentStart = i + 1;
+                continue;
+            }
+            char c = path[i];
+            if (c < ' ' || c == ':' || c == '/' || c == '"' || c == '<' || c == '>' ||
+                c == '|' || c == '*' || c == '?') return false;
+        }
+        return true;
+    }
+    internal static bool TryGetFixedPathAttributes(string path, uint drives, out FileAttributes attributes) {
+        attributes = 0;
+        if (!IsFixedPath(path, drives)) return false;
+        try {
+            // Check parents from the root down before looking at the final component.
+            const FileAttributes parentFlags = FileAttributes.Directory | FileAttributes.ReparsePoint;
+            for (int i = 3; i < path.Length; i++) {
+                if (path[i] == '\\' && (File.GetAttributes(path.Substring(0, i)) & parentFlags) != FileAttributes.Directory)
+                    return false;
+            }
+            attributes = File.GetAttributes(path);
+            return true;
+        } catch (Exception e) {
+            if (!FileError(e)) throw;
+            return false;
+        }
+    }
+    internal static bool TryGetFixedFileAttributes(string path, uint drives, out FileAttributes attributes) {
+        return TryGetFixedPathAttributes(path, drives, out attributes) && (attributes & FileAttributes.Directory) == 0;
+    }
     internal static void SaveLines(string file, IEnumerable<string> lines) {
-        string tmp = file + ".part";
-        File.WriteAllLines(tmp, lines, new UTF8Encoding(false));
-        if (File.Exists(file)) File.Replace(tmp, file, null);
-        else File.Move(tmp, file);
+        string tmp = Path.Combine(Path.GetDirectoryName(file), Guid.NewGuid().ToString("N") + ".part");
+        bool created = false;
+        try {
+            using (var stream = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None)) {
+                created = true;
+                using (var writer = new StreamWriter(stream, new UTF8Encoding(false))) {
+                    foreach (string line in lines) writer.WriteLine(line);
+                }
+            }
+            if (File.Exists(file)) File.Replace(tmp, file, null);
+            else File.Move(tmp, file);
+            created = false;
+        } finally {
+            if (created) {
+                try { File.Delete(tmp); }
+                catch (Exception e) { if (!FileError(e)) throw; }
+            }
+        }
     }
 }
 
@@ -50,10 +113,13 @@ sealed class Entry {
 
 sealed class DiskIndex {
     static readonly StringComparer CI = StringComparer.OrdinalIgnoreCase;
+    static readonly string homePrefix = Program.Home + Path.DirectorySeparatorChar;
     readonly string cache = Path.Combine(Program.Home, "index.txt");
-    readonly Dictionary<string, Entry> files = new Dictionary<string, Entry>(CI);
+    Dictionary<string, Entry> files = new Dictionary<string, Entry>(CI);
     readonly List<FileSystemWatcher> watchers = new List<FileSystemWatcher>();
-    readonly ConcurrentQueue<FileSystemEventArgs> changes = new ConcurrentQueue<FileSystemEventArgs>();
+    const int MaxPendingChanges = 32768;
+    readonly object changeGate = new object();
+    readonly Queue<FileSystemEventArgs> changes = new Queue<FileSystemEventArgs>();
     volatile bool rescan, stopping;
     internal volatile bool Scanning = true;
     internal volatile Entry[] Snapshot = new Entry[0];
@@ -62,42 +128,50 @@ sealed class DiskIndex {
     bool preview;
     internal void Stop() { stopping = true; }
     internal void Run() {
-        try { if (File.Exists(cache)) {
-            foreach (string p in File.ReadLines(cache)) if (p.Length > 2) files[p] = new Entry(p);
-            Publish();
-        }} catch (Exception e) { if (!Program.FileError(e)) throw; }
+        try { RunIndex(); }
+        finally { StopWatchers(); }
+    }
+    void RunIndex() {
+        try {
+            if (File.Exists(cache)) {
+                uint drives = Program.GetFixedDrives();
+                foreach (string p in File.ReadLines(cache))
+                    if (Program.IsFixedPath(p, drives) && !Excluded(p)) files[p] = new Entry(p);
+                Publish();
+            }
+        } catch (Exception e) { if (!Program.FileError(e)) throw; }
         DateTime nextScan = DateTime.MinValue, nextSave = DateTime.MinValue;
         bool dirty = false;
         while (!stopping) {
             try {
                 if (rescan || DateTime.UtcNow >= nextScan) {
-                    rescan = false; Scanning = true;
-                    foreach (var w in watchers) w.Dispose();
-                    watchers.Clear();
-                    FileSystemEventArgs ignored;
-                    while (changes.TryDequeue(out ignored)) {}
+                    Scanning = true;
+                    StopWatchers();
+                    lock (changeGate) {
+                        changes.Clear();
+                        rescan = false;
+                    }
                     preview = Snapshot.Length == 0; nextPreview = DateTime.UtcNow.AddSeconds(2);
                     var fresh = new Dictionary<string, Entry>(CI);
                     foreach (var d in DriveInfo.GetDrives()) {
                         if (d.DriveType != DriveType.Fixed || !d.IsReady) continue;
                         Watch(d.RootDirectory.FullName);
-                        Walk(d.RootDirectory.FullName, fresh);
+                        Walk(d.RootDirectory.FullName, fresh, merge: false);
                         if (stopping) return;
                     }
-                    files.Clear(); foreach (var pair in fresh) files.Add(pair.Key, pair.Value);
+                    files = fresh;
                     preview = false; Publish(); Scanning = false; dirty = true;
                     nextScan = DateTime.UtcNow.AddMinutes(30);
                 }
                 bool updated = false;
                 FileSystemEventArgs ev;
-                for (int i = 0; i < 4096 && changes.TryDequeue(out ev); i++) {
-                    if (Excluded(ev.FullPath)) continue;
+                for (int i = 0; i < 4096 && TryDequeueChange(out ev); i++) {
                     var rename = ev as RenamedEventArgs;
-                    if (rename != null) Remove(rename.OldFullPath);
-                    if (ev.ChangeType == WatcherChangeTypes.Deleted) Remove(ev.FullPath);
-                    else if (File.Exists(ev.FullPath)) files[ev.FullPath] = new Entry(ev.FullPath);
-                    else if (Directory.Exists(ev.FullPath)) Walk(ev.FullPath, files);
-                    updated = true;
+                    if (rename != null && !Excluded(rename.OldFullPath)) updated |= Remove(rename.OldFullPath);
+                    if (Excluded(ev.FullPath)) continue;
+                    if (ev.ChangeType == WatcherChangeTypes.Deleted) updated |= Remove(ev.FullPath);
+                    else if (File.Exists(ev.FullPath)) updated |= AddFile(files, ev.FullPath);
+                    else if (Directory.Exists(ev.FullPath)) updated |= Walk(ev.FullPath, files, merge: true);
                 }
                 if (updated) { Publish(); dirty = true; }
                 if (dirty && DateTime.UtcNow >= nextSave) {
@@ -114,25 +188,59 @@ sealed class DiskIndex {
     }
     void Publish() { Snapshot = files.Values.ToArray(); }
     bool Excluded(string path) {
-        return path.StartsWith(Program.Home + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        return CI.Equals(path, Program.Home) || path.StartsWith(homePrefix, StringComparison.OrdinalIgnoreCase);
+    }
+    void QueueChange(object sender, FileSystemEventArgs change) {
+        lock (changeGate) {
+            if (changes.Count >= MaxPendingChanges) rescan = true;
+            else changes.Enqueue(change);
+        }
+    }
+    bool TryDequeueChange(out FileSystemEventArgs change) {
+        lock (changeGate) {
+            if (changes.Count == 0) {
+                change = null;
+                return false;
+            }
+            change = changes.Dequeue();
+            return true;
+        }
+    }
+    void StopWatchers() {
+        foreach (var watcher in watchers) watcher.Dispose();
+        watchers.Clear();
     }
     void Watch(string root) {
+        FileSystemWatcher watcher = null;
         try {
-            var w = new FileSystemWatcher(root);
-            w.IncludeSubdirectories = true;
-            w.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName;
-            w.InternalBufferSize = 65536;
-            w.Created += (s,e) => changes.Enqueue(e); w.Deleted += (s,e) => changes.Enqueue(e);
-            w.Renamed += (s,e) => changes.Enqueue(e); w.Error += (s,e) => rescan = true;
-            watchers.Add(w); w.EnableRaisingEvents = true;
+            watcher = new FileSystemWatcher(root);
+            watcher.IncludeSubdirectories = true;
+            watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName;
+            watcher.InternalBufferSize = 65536;
+            watcher.Created += QueueChange; watcher.Deleted += QueueChange;
+            watcher.Renamed += QueueChange; watcher.Error += (s,e) => rescan = true;
+            watcher.EnableRaisingEvents = true;
+            watchers.Add(watcher);
+            watcher = null;
         } catch (Exception e) { if (!Program.FileError(e)) throw; }
+        finally { if (watcher != null) watcher.Dispose(); }
     }
-    void Remove(string path) {
-        if (files.Remove(path)) return;
+    bool Remove(string path) {
+        if (files.Remove(path)) return true;
         string prefix = path + Path.DirectorySeparatorChar;
-        foreach (string child in files.Keys.Where(k => k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToArray()) files.Remove(child);
+        var children = files.Keys.Where(k => k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToArray();
+        foreach (string child in children) files.Remove(child);
+        return children.Length != 0;
     }
-    void Walk(string root, Dictionary<string,Entry> target) {
+    static bool AddFile(Dictionary<string, Entry> target, string path) {
+        Entry existing;
+        if (target.TryGetValue(path, out existing) && String.Equals(existing.PathName, path, StringComparison.Ordinal))
+            return false;
+        target[path] = new Entry(path);
+        return true;
+    }
+    bool Walk(string root, Dictionary<string, Entry> target, bool merge) {
+        bool updated = false;
         var dirs = new Stack<string>(); dirs.Push(root);
         while (dirs.Count > 0 && !stopping) {
             if (preview && DateTime.UtcNow >= nextPreview) {
@@ -143,85 +251,121 @@ sealed class DiskIndex {
                 if (CI.Equals(dir, Program.Home) || (File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0) continue;
                 foreach (var item in new DirectoryInfo(dir).EnumerateFileSystemInfos()) {
                     var a = item.Attributes;
-                    if ((a & FileAttributes.Directory) == 0) target[item.FullName] = new Entry(item.FullName);
-                    else if ((a & FileAttributes.ReparsePoint) == 0) dirs.Push(item.FullName);
+                    if ((a & FileAttributes.Directory) == 0) {
+                        string path = item.FullName;
+                        if (merge) updated |= AddFile(target, path);
+                        else target[path] = new Entry(path);
+                    } else if ((a & FileAttributes.ReparsePoint) == 0) dirs.Push(item.FullName);
                 }
             } catch (Exception e) { if (!Program.FileError(e)) throw; }
         }
+        return updated;
     }
 }
 
 sealed class Recent {
     readonly string file = Path.Combine(Program.Home, "recent.txt");
-    readonly Dictionary<string,long> times = new Dictionary<string,long>(StringComparer.OrdinalIgnoreCase);
+    static readonly StringComparer CI = StringComparer.OrdinalIgnoreCase;
+    volatile Dictionary<string, long> times = new Dictionary<string, long>(CI);
     readonly object gate = new object();
     internal Recent() {
         try {
-            if (File.Exists(file)) foreach (var line in File.ReadLines(file)) {
-                int i = line.IndexOf('\t'); long ticks;
-                if (i > 0 && long.TryParse(line.Substring(0,i),out ticks)) times[line.Substring(i+1)] = ticks;
+            if (File.Exists(file)) {
+                uint drives = Program.GetFixedDrives();
+                foreach (var line in File.ReadLines(file)) {
+                    int i = line.IndexOf('\t');
+                    long ticks;
+                    if (i <= 0 || !long.TryParse(line.Substring(0, i), out ticks)) continue;
+                    string path = line.Substring(i + 1);
+                    if (Program.IsFixedPath(path, drives)) times[path] = ticks;
+                }
             }
         } catch (Exception e) { if (!Program.FileError(e)) throw; }
     }
-    internal Dictionary<string,long> Copy() {
-        lock (gate) return new Dictionary<string,long>(times,StringComparer.OrdinalIgnoreCase);
+    // A dictionary is never modified after it has been published to readers.
+    internal IReadOnlyDictionary<string, long> Snapshot { get { return times; } }
+    internal void Remember(string path) {
+        Merge(new[] { new KeyValuePair<string, long>(path, DateTime.UtcNow.Ticks) }, Program.GetFixedDrives());
     }
-    internal void Remember(string p) { Merge(new[] {new KeyValuePair<string,long>(p,DateTime.UtcNow.Ticks)}); }
-    void Merge(IEnumerable<KeyValuePair<string,long>> items) {
+    void Merge(IEnumerable<KeyValuePair<string, long>> items, uint drives) {
         lock (gate) {
-            foreach (var x in items) {
+            var updated = new Dictionary<string, long>(times, CI);
+            foreach (var item in items) {
                 long old;
-                if (!times.TryGetValue(x.Key,out old) || old < x.Value) times[x.Key] = x.Value;
+                if (!updated.TryGetValue(item.Key, out old) || old < item.Value) updated[item.Key] = item.Value;
             }
-            var kept = times.Where(x => File.Exists(x.Key)).OrderByDescending(x => x.Value).Take(10).ToArray();
-            times.Clear(); foreach (var x in kept) times[x.Key] = x.Value;
-            try { Program.SaveLines(file, kept.Select(x => x.Value.ToString() + "\t" + x.Key)); }
+            var kept = updated.OrderByDescending(item => item.Value).Where(item => {
+                FileAttributes attributes;
+                return Program.TryGetFixedFileAttributes(item.Key, drives, out attributes);
+            }).Take(10).ToArray();
+            times = kept.ToDictionary(item => item.Key, item => item.Value, CI);
+            try { Program.SaveLines(file, kept.Select(item => item.Value.ToString() + "\t" + item.Key)); }
             catch (Exception e) { if (!Program.FileError(e)) throw; }
         }
     }
     internal void ImportExplorer() {
-        var items = new List<KeyValuePair<string,long>>();
+        uint drives = Program.GetFixedDrives();
+        var items = new List<KeyValuePair<string, long>>();
         object shell = null;
         try {
             string dir = Environment.GetFolderPath(Environment.SpecialFolder.Recent);
-            shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell",true));
-            foreach (var f in new DirectoryInfo(dir).EnumerateFiles("*.lnk").OrderByDescending(x=>x.LastWriteTimeUtc)) {
-                object link = null;
-                try {
-                    link = ((dynamic)shell).CreateShortcut(f.FullName);
-                    string path = ((dynamic)link).TargetPath;
-                    if (!String.IsNullOrEmpty(path) && File.Exists(path) && !items.Any(x=>String.Equals(x.Key,path,StringComparison.OrdinalIgnoreCase)))
-                        items.Add(new KeyValuePair<string,long>(path,f.LastWriteTimeUtc.Ticks));
-                } catch (COMException) {} finally { if(link!=null) Marshal.ReleaseComObject(link); }
-                if (items.Count == 10) break;
+            FileAttributes attributes;
+            const FileAttributes directoryFlags = FileAttributes.Directory | FileAttributes.ReparsePoint;
+            if (Program.TryGetFixedPathAttributes(dir, drives, out attributes) &&
+                (attributes & directoryFlags) == FileAttributes.Directory) {
+                shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell", true));
+                foreach (var f in new DirectoryInfo(dir).EnumerateFiles("*.lnk").OrderByDescending(x => x.LastWriteTimeUtc)) {
+                    if ((f.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+                    object link = null;
+                    try {
+                        link = ((dynamic)shell).CreateShortcut(f.FullName);
+                        string path = ((dynamic)link).TargetPath;
+                        if (Program.TryGetFixedFileAttributes(path, drives, out attributes) &&
+                            !items.Any(item => CI.Equals(item.Key, path)))
+                            items.Add(new KeyValuePair<string, long>(path, f.LastWriteTimeUtc.Ticks));
+                    } catch (COMException) {} finally { if (link != null) Marshal.ReleaseComObject(link); }
+                    if (items.Count == 10) break;
+                }
             }
         } catch (Exception e) { if (!Program.FileError(e) && !(e is COMException)) throw; }
-        finally { if (shell!=null) Marshal.ReleaseComObject(shell); }
-        Merge(items);
+        finally { if (shell != null) Marshal.ReleaseComObject(shell); }
+        Merge(items, drives);
     }
 }
 
-sealed class Match {
-    internal Entry Item; internal int Rank; internal long Last;
+struct Match {
+    const int Limit = 100;
+    static readonly IComparer<Match> Order = Comparer<Match>.Create(Compare);
+    internal readonly Entry Item;
+    readonly int Rank;
+    readonly long Last;
+    Match(Entry item, int rank, long last) {
+        Item = item;
+        Rank = rank;
+        Last = last;
+    }
     internal static int Compare(Match x, Match y) {
         int c = x.Rank.CompareTo(y.Rank); if (c!=0) return c;
         c = y.Last.CompareTo(x.Last); if (c!=0) return c;
         c = StringComparer.OrdinalIgnoreCase.Compare(x.Item.Name,y.Item.Name); if (c!=0) return c;
         return StringComparer.OrdinalIgnoreCase.Compare(x.Item.PathName,y.Item.PathName);
     }
-    internal static Entry[] Search(Entry[] all, string q, Dictionary<string,long> times, CancellationToken token) {
-        var best = new SortedSet<Match>(Comparer<Match>.Create(Compare));
+    internal static Entry[] Search(Entry[] all, string q, IReadOnlyDictionary<string, long> times, CancellationToken token) {
+        var best = new SortedSet<Match>(Order);
+        Match worst = default(Match);
         int i=0;
         foreach (Entry item in all) {
             if ((i++ & 1023)==0) token.ThrowIfCancellationRequested();
             int pos = item.Name.IndexOf(q,StringComparison.OrdinalIgnoreCase);
             if (pos<0) continue;
             int rank = String.Equals(item.Name,q,StringComparison.OrdinalIgnoreCase) || String.Equals(item.Stem,q,StringComparison.OrdinalIgnoreCase) ? 0 : pos==0 ? 1 : 2;
-            if (best.Count==100 && rank>best.Max.Rank) continue;
+            bool full = best.Count == Limit;
+            if (full && rank > worst.Rank) continue;
             long last; times.TryGetValue(item.PathName,out last);
-            var result = new Match {Item=item, Rank=rank, Last=last};
-            if (best.Count<100 || Compare(result,best.Max)<0) {
-                best.Add(result); if (best.Count>100) best.Remove(best.Max);
+            var result = new Match(item, rank, last);
+            if ((!full || Compare(result, worst) < 0) && best.Add(result)) {
+                if (full) best.Remove(worst);
+                if (best.Count == Limit) worst = best.Max;
             }
         }
         return best.Select(m=>m.Item).ToArray();
@@ -230,20 +374,15 @@ sealed class Match {
 
 sealed class Finder : Form {
     const int WM_INPUT=0xff;
-    static readonly Color WindowColor = Color.FromArgb(23, 26, 29);
-    static readonly Color InputColor = Color.FromArgb(43, 48, 52);
-    static readonly Color RowColor = Color.FromArgb(32, 36, 39);
-    static readonly Color ActiveRowColor = Color.FromArgb(37, 53, 53);
-    static readonly Color TextColor = Color.FromArgb(240, 244, 244);
-    static readonly Color HintColor = Color.FromArgb(184, 196, 197);
-    static readonly Color DividerColor = Color.FromArgb(66, 75, 78);
-    static readonly Color Mint = Color.FromArgb(118, 247, 211);
-    [DllImport("dwmapi.dll")]
-    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
-    readonly Panel searchBox = new Panel();
-    readonly Font searchFont = new Font("Segoe UI", 14);
-    readonly Icon appIcon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
-
+    const int EM_SETCUEBANNER=0x1501;
+    static readonly Color WindowBackground = Color.FromArgb(21, 23, 25);
+    static readonly Color SearchBackground = Color.FromArgb(36, 39, 43);
+    static readonly Color TextColor = Color.FromArgb(241, 243, 244);
+    static readonly Color SecondaryText = Color.FromArgb(167, 176, 183);
+    static readonly Color Separator = Color.FromArgb(46, 52, 57);
+    static readonly Color SelectedBackground = Color.FromArgb(32, 48, 46);
+    static readonly Color Accent = Color.FromArgb(114, 231, 203);
+    static readonly bool IsWindows = Environment.OSVersion.Platform == PlatformID.Win32NT;
     [StructLayout(LayoutKind.Sequential)] struct RawDevice {
         public ushort Page, Usage; public uint Flags; public IntPtr Target;
     }
@@ -252,86 +391,128 @@ sealed class Finder : Form {
     [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr input,uint cmd,IntPtr data,ref uint size,uint header);
     [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    static extern IntPtr SendMessage(IntPtr hwnd, int message, IntPtr wParam, string text);
+    [DllImport("dwmapi.dll")]
+    static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+    [DllImport("uxtheme.dll", CharSet=CharSet.Unicode)]
+    static extern int SetWindowTheme(IntPtr hwnd, string subAppName, string subIdList);
     readonly TextBox query = new TextBox();
+    readonly SearchField searchField;
+    readonly TableLayoutPanel footer = new TableLayoutPanel();
     readonly ListBox list = new ListBox();
     readonly Label status = new Label();
+    readonly Label shortcuts = new Label();
     readonly NotifyIcon tray = new NotifyIcon();
     readonly ToolStripMenuItem startup = new ToolStripMenuItem("Запускать при входе в Windows");
     readonly System.Windows.Forms.Timer refresh = new System.Windows.Forms.Timer();
-    readonly Font small = new Font("Segoe UI",9);
+    readonly Font resultFont = new Font("Segoe UI", 12);
+    readonly Font searchFont = new Font("Segoe UI", 16);
+    readonly Font small = new Font("Segoe UI", 9);
+    readonly Icon appIcon;
+    readonly int layoutDpi;
     readonly DiskIndex index = new DiskIndex();
     readonly Recent recent = new Recent();
     readonly Stopwatch clock = Stopwatch.StartNew();
     IntPtr packet = Marshal.AllocHGlobal(128);
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    static readonly HashSet<string> ActiveExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+        ".exe", ".com", ".bat", ".cmd", ".scr", ".pif", ".cpl", ".msc", ".msi", ".msp",
+        ".msix", ".msixbundle", ".appx", ".appxbundle", ".appinstaller", ".application", ".appref-ms",
+        ".ps1", ".psm1", ".hta", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".sct",
+        ".lnk", ".url", ".website", ".scf", ".reg", ".jar", ".py", ".pyw"
+    };
     long pressed, released=-1000;
     bool controlHeld, chord, importing, closing;
     CancellationTokenSource pending;
     Entry[] shownSnapshot;
-    bool wasScanning;
-    string displayedQuery, openWhenReady;
+    bool wasScanning, highContrast;
+    string displayedQuery, openWhenReady, shownProblem;
     public Finder() {
+        SuspendLayout();
         Text = "QuickFind";
-        Icon = appIcon;
-        Font = new Font("Segoe UI", 11);
-        BackColor = WindowColor;
-        ForeColor = TextColor;
-        Size = new Size(690, 480);
+        Font = resultFont;
+        AutoScaleDimensions = new SizeF(96, 96);
+        AutoScaleMode = AutoScaleMode.Dpi;
+        layoutDpi = Math.Max(1, (int)Math.Round(CurrentAutoScaleDimensions.Width));
+        ClientSize = new Size(690, 452);
         MinimumSize = new Size(440, 300);
         StartPosition = FormStartPosition.CenterScreen;
         ShowInTaskbar = false;
         KeyPreview = true;
+        appIcon = LoadAppIcon();
+        if (appIcon != null) Icon = appIcon;
 
         var layout = new TableLayoutPanel {
-            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(14),
-            BackColor = WindowColor
+            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(16, 14, 16, 0)
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        searchBox.Dock = DockStyle.Top;
-        searchBox.Height = searchFont.Height + 22;
-        searchBox.Margin = new Padding(0, 0, 0, 12);
-        searchBox.Padding = new Padding(12, 10, 42, 6);
-        searchBox.BackColor = InputColor;
-        searchBox.Paint += PaintSearchBox;
-        searchBox.MouseDown += (sender, args) => query.Focus();
-
-        query.Font = searchFont;
-        query.BackColor = InputColor;
-        query.ForeColor = TextColor;
         query.BorderStyle = BorderStyle.None;
+        query.Font = searchFont;
         query.AccessibleName = "Имя файла";
-        query.Dock = DockStyle.Top;
-        query.GotFocus += (sender, args) => searchBox.Invalidate();
-        query.LostFocus += (sender, args) => searchBox.Invalidate();
-        searchBox.Controls.Add(query);
-        layout.Controls.Add(searchBox, 0, 0);
+        query.HandleCreated += (s, e) => {
+            if (IsWindows) SendMessage(query.Handle, EM_SETCUEBANNER, new IntPtr(1), "Имя файла");
+        };
+        searchField = new SearchField(query, layoutDpi) {
+            Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 8), TabIndex = 0
+        };
+        layout.Controls.Add(searchField, 0, 0);
 
         list.Dock = DockStyle.Fill;
-        list.Margin = System.Windows.Forms.Padding.Empty;
+        list.Margin = Padding.Empty;
+        list.TabIndex = 1;
         list.BorderStyle = BorderStyle.None;
-        list.BackColor = RowColor;
-        list.ForeColor = TextColor;
         list.DrawMode = DrawMode.OwnerDrawFixed;
         list.IntegralHeight = false;
-        list.ItemHeight = Font.Height + small.Height + 16;
         list.AccessibleName = "Найденные файлы";
+        list.HandleCreated += (s, e) => ApplyListTheme();
         layout.Controls.Add(list, 0, 1);
 
-        status.ForeColor = HintColor;
-        status.Font = small;
+        footer.AutoSize = true;
+        footer.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        footer.Dock = DockStyle.Fill;
+        footer.Margin = Padding.Empty;
+        footer.ColumnCount = 1;
+        footer.RowCount = 2;
+        footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        footer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        footer.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        footer.Paint += (s, e) => {
+            using (var pen = new Pen(highContrast ? SystemColors.WindowText : Separator))
+                e.Graphics.DrawLine(pen, 0, 0, footer.ClientSize.Width, 0);
+        };
         status.AutoSize = true;
         status.Dock = DockStyle.Fill;
-        status.Margin = new Padding(0, 10, 0, 0);
-        layout.Controls.Add(status, 0, 2);
+        status.Margin = new Padding(0, 7, 0, 0);
+        status.Font = small;
+        status.TextAlign = ContentAlignment.MiddleLeft;
+        status.Visible = false;
+        shortcuts.AutoSize = true;
+        shortcuts.Dock = DockStyle.Fill;
+        shortcuts.Margin = new Padding(0, 1, 0, 0);
+        shortcuts.Font = small;
+        shortcuts.Text = "↑ ↓  Выбрать    Enter  Открыть    Esc  Закрыть";
+        shortcuts.TextAlign = ContentAlignment.MiddleLeft;
+        footer.Controls.Add(status, 0, 0);
+        footer.Controls.Add(shortcuts, 0, 1);
+        layout.Controls.Add(footer, 0, 2);
         Controls.Add(layout);
+        ApplyTheme();
+        ResumeLayout(true);
         list.DrawItem+=DrawFile; list.MouseDoubleClick+=(s,e)=>{if(list.IndexFromPoint(e.Location)>=0) OpenSelected();};
         query.TextChanged+=(s,e)=>{openWhenReady=null;UpdateList();};
-        VisibleChanged+=(s,e)=>{if(!Visible) openWhenReady=null;};
-        tray.Icon=appIcon; tray.Text="Поиск файлов · дважды Ctrl";
+        VisibleChanged+=(s,e)=>{
+            if (!Visible) {
+                openWhenReady = null;
+                if (pending != null) pending.Cancel();
+            }
+        };
+        tray.Icon = appIcon ?? SystemIcons.Application;
+        tray.Text = "QuickFind · дважды Ctrl";
         var menu=new ContextMenuStrip(); menu.Items.Add("Открыть поиск",null,(s,e)=>ShowFinder());
         startup.Click+=(s,e)=>SetStartup(!startup.Checked); menu.Items.Add(startup);
         menu.Items.Add("Выход",null,(s,e)=>{closing=true;tray.Visible=false;Application.Exit();});
@@ -339,32 +520,135 @@ sealed class Finder : Form {
         using(var key=Registry.CurrentUser.OpenSubKey(RunKey)) startup.Checked=key!=null && key.GetValue("QuickFind")!=null;
         refresh.Interval=700; refresh.Tick+=(s,e)=>{
             if (!Visible) return;
-            if (!Object.ReferenceEquals(shownSnapshot,index.Snapshot) || wasScanning!=index.Scanning) UpdateList();
+            if (!Object.ReferenceEquals(shownSnapshot, index.Snapshot) || wasScanning != index.Scanning ||
+                shownProblem != index.Problem) UpdateList();
         };
         refresh.Start();
     }
-    protected override void OnHandleCreated(EventArgs e) {
-        base.OnHandleCreated(e);
-        int dark = 1;
-        if (DwmSetWindowAttribute(Handle, 20, ref dark, sizeof(int)) != 0)
-            DwmSetWindowAttribute(Handle, 19, ref dark, sizeof(int));
+    static int ScalePixels(int pixels, int dpi) {
+        return (int)Math.Round(pixels * dpi / 96.0);
     }
-
-    void PaintSearchBox(object sender, PaintEventArgs e) {
-        var box = searchBox.ClientRectangle;
-        if (box.Width < 2 || box.Height < 2) return;
-        using (var border = new Pen(query.Focused ? Mint : DividerColor))
-            e.Graphics.DrawRectangle(border, 0, 0, box.Width - 1, box.Height - 1);
-        float unit = Math.Max(1f, searchFont.Height / 22f);
-        float x = box.Right - 30 * unit, y = box.Height / 2f - 7 * unit;
-        e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-        using (var ink = new Pen(HintColor, 1.6f * unit)) {
-            e.Graphics.DrawEllipse(ink, x, y, 11 * unit, 11 * unit);
-            e.Graphics.DrawLine(ink, x + 9.5f * unit, y + 9.5f * unit,
-                x + 15 * unit, y + 15 * unit);
+    static GraphicsPath RoundedRectangle(RectangleF bounds, float radius) {
+        var path = new GraphicsPath();
+        float diameter = 2 * Math.Min(radius, Math.Min(bounds.Width, bounds.Height) / 2);
+        if (diameter <= 0) return path;
+        path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+        path.AddArc(bounds.Left, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+    static void DrawMagnifier(Graphics graphics, RectangleF bounds, Color color, float width) {
+        using (var pen = new Pen(color, width) { StartCap = LineCap.Round, EndCap = LineCap.Round }) {
+            float lens = bounds.Width * 0.63f;
+            graphics.DrawEllipse(pen, bounds.Left, bounds.Top, lens, lens);
+            graphics.DrawLine(pen, bounds.Left + lens * 0.85f, bounds.Top + lens * 0.85f,
+                bounds.Left + bounds.Width * 0.91f, bounds.Top + bounds.Height * 0.91f);
         }
     }
-
+    static Icon LoadAppIcon() {
+        if (!IsWindows) return null;
+        try { return System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+        catch (Exception e) {
+            if (!Program.FileError(e)) throw;
+            return null;
+        }
+    }
+    void UpdateRowHeight() {
+        list.ItemHeight = Math.Min(255, Math.Max(ScalePixels(57, layoutDpi),
+            resultFont.Height + small.Height + ScalePixels(14, layoutDpi)));
+    }
+    void ApplyTheme() {
+        if (searchField == null) return;
+        highContrast = SystemInformation.HighContrast;
+        BackColor = highContrast ? SystemColors.Window : WindowBackground;
+        ForeColor = highContrast ? SystemColors.WindowText : TextColor;
+        list.BackColor = BackColor;
+        list.ForeColor = ForeColor;
+        footer.BackColor = BackColor;
+        status.ForeColor = shortcuts.ForeColor = highContrast ? SystemColors.WindowText : SecondaryText;
+        searchField.ApplyTheme(highContrast);
+        ApplyCaptionTheme();
+        ApplyListTheme();
+        UpdateRowHeight();
+        list.Invalidate();
+        footer.Invalidate();
+    }
+    void ApplyCaptionTheme() {
+        if (!IsWindows || !IsHandleCreated) return;
+        try {
+            int dark = highContrast ? 0 : 1;
+            if (DwmSetWindowAttribute(Handle, 20, ref dark, sizeof(int)) != 0)
+                DwmSetWindowAttribute(Handle, 19, ref dark, sizeof(int));
+            int caption = highContrast ? -1 : ColorTranslator.ToWin32(WindowBackground);
+            int text = highContrast ? -1 : ColorTranslator.ToWin32(TextColor);
+            DwmSetWindowAttribute(Handle, 35, ref caption, sizeof(int));
+            DwmSetWindowAttribute(Handle, 36, ref text, sizeof(int));
+        } catch (DllNotFoundException) {} catch (EntryPointNotFoundException) {}
+    }
+    void ApplyListTheme() {
+        if (!IsWindows || !list.IsHandleCreated) return;
+        try { SetWindowTheme(list.Handle, highContrast ? null : "DarkMode_Explorer", null); }
+        catch (DllNotFoundException) {} catch (EntryPointNotFoundException) {}
+    }
+    protected override void OnHandleCreated(EventArgs e) {
+        base.OnHandleCreated(e);
+        ApplyCaptionTheme();
+        if (searchField != null) UpdateRowHeight();
+    }
+    protected override void OnSystemColorsChanged(EventArgs e) {
+        base.OnSystemColorsChanged(e);
+        ApplyTheme();
+    }
+    sealed class SearchField : Panel {
+        readonly TextBox input;
+        readonly int dpi;
+        bool highContrast;
+        internal SearchField(TextBox input, int dpi) {
+            this.input = input;
+            this.dpi = dpi;
+            DoubleBuffered = true;
+            ResizeRedraw = true;
+            TabStop = false;
+            Controls.Add(input);
+            input.GotFocus += (s, e) => Invalidate();
+            input.LostFocus += (s, e) => Invalidate();
+        }
+        internal void ApplyTheme(bool useHighContrast) {
+            highContrast = useHighContrast;
+            BackColor = highContrast ? SystemColors.Window : WindowBackground;
+            input.BackColor = highContrast ? SystemColors.Window : SearchBackground;
+            input.ForeColor = highContrast ? SystemColors.WindowText : TextColor;
+            Invalidate();
+        }
+        protected override void OnLayout(LayoutEventArgs e) {
+            base.OnLayout(e);
+            if (input == null) return;
+            int inset = ScalePixels(15, dpi), glyphArea = ScalePixels(44, dpi);
+            int height = input.PreferredHeight;
+            input.SetBounds(inset, Math.Max(0, (Height - height) / 2), Math.Max(0, Width - inset - glyphArea), height);
+        }
+        protected override void OnMouseDown(MouseEventArgs e) {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Left) input.Focus();
+        }
+        protected override void OnPaint(PaintEventArgs e) {
+            base.OnPaint(e);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            Color outline = highContrast ? SystemColors.WindowText :
+                input.Focused ? Color.FromArgb(65, 79, 80) : Separator;
+            using (var shape = RoundedRectangle(new RectangleF(0.5f, 0.5f, Width - 1, Height - 1), ScalePixels(11, dpi)))
+            using (var fill = new SolidBrush(input.BackColor))
+            using (var pen = new Pen(outline)) {
+                e.Graphics.FillPath(fill, shape);
+                e.Graphics.DrawPath(pen, shape);
+            }
+            int glyphSize = ScalePixels(20, dpi);
+            var glyph = new RectangleF(Width - ScalePixels(15, dpi) - glyphSize, (Height - glyphSize) / 2f, glyphSize, glyphSize);
+            DrawMagnifier(e.Graphics, glyph, highContrast ? SystemColors.WindowText : SecondaryText, ScalePixels(2, dpi));
+        }
+    }
     internal void SetStartup(bool enabled) {
         try {
             using(var key=Registry.CurrentUser.CreateSubKey(RunKey)) {
@@ -427,12 +711,12 @@ sealed class Finder : Form {
         string q=query.Text;
         var snapshot=index.Snapshot; shownSnapshot=snapshot; wasScanning=index.Scanning;
         try {
-            var times=recent.Copy();
+            var times = recent.Snapshot;
             Entry[] hits;
             if (q.Length==0) hits=times.OrderByDescending(x=>x.Value).Take(10).Select(x=>new Entry(x.Key)).ToArray();
             else {
                 if(displayedQuery!=q) list.Items.Clear();
-                status.Text="Поиск…";
+                SetStatus("Поиск…");
                 await Task.Delay(65,token);
                 hits=await Task.Run(()=>Match.Search(snapshot,q,times,token),token);
             }
@@ -444,43 +728,92 @@ sealed class Finder : Form {
                 list.Items.Clear(); list.Items.AddRange(hits);
                 if(hits.Length>0) list.SelectedIndex=Math.Max(0,Array.FindIndex(hits,v=>old!=null && v.PathName==old.PathName));
             } finally { list.EndUpdate(); }
-            string note=q.Length==0 ? (hits.Length==0?"Пока нет недавних файлов":"Недавние файлы") :
-                hits.Length==0 ? "Совпадений пока нет" : "Enter — открыть    ↑ ↓ — выбрать    Esc — закрыть";
-            status.Text=note+(index.Scanning?"   ·   Идёт индексация дисков…":"")+
-                (index.Problem.Length==0?"":"   ·   "+index.Problem);
+            string note = q.Length == 0 ? (hits.Length == 0 ? "Пока нет недавних файлов" : "Недавние файлы") :
+                hits.Length == 0 ? "Совпадений пока нет" : "";
+            shownProblem = index.Problem;
+            SetStatus(String.Join("   ·   ", new[] {
+                note, index.Scanning ? "Идёт индексация дисков…" : "", shownProblem
+            }.Where(text => text.Length != 0)));
             if(openWhenReady==q) {openWhenReady=null; OpenSelected();}
         } catch(OperationCanceledException) {} finally { if(pending==source) pending=null; source.Dispose(); }
+    }
+    void SetStatus(string message) {
+        status.Text = message;
+        status.Visible = message.Length != 0;
     }
     void DrawFile(object sender, DrawItemEventArgs e) {
         if (e.Index < 0 || e.Index >= list.Items.Count) return;
         var item = (Entry)list.Items[e.Index];
-        Rectangle bounds = e.Bounds;
-        bool selected = (e.State & DrawItemState.Selected) != 0;
-        using (var fill = new SolidBrush(selected ? ActiveRowColor : RowColor))
-            e.Graphics.FillRectangle(fill, bounds);
+        bool selected = (e.State & DrawItemState.Selected) != 0 || e.Index == list.SelectedIndex;
+        Color background = highContrast ? SystemColors.Window : WindowBackground;
+        Color main = highContrast ? SystemColors.WindowText : TextColor;
+        Color secondary = highContrast ? SystemColors.WindowText : SecondaryText;
+        using (var brush = new SolidBrush(background)) e.Graphics.FillRectangle(brush, e.Bounds);
+
+        int dpi = layoutDpi;
+        var outline = new Rectangle(e.Bounds.Left + 1, e.Bounds.Top + 1, e.Bounds.Width - 2, e.Bounds.Height - 3);
         if (selected) {
-            using (var pen = new Pen(Mint, 2))
-                e.Graphics.DrawRectangle(pen, bounds.X + 1, bounds.Y + 1,
-                    Math.Max(1, bounds.Width - 3), Math.Max(1, bounds.Height - 3));
-        } else {
-            using (var pen = new Pen(DividerColor))
-                e.Graphics.DrawLine(pen, bounds.Left + 12, bounds.Bottom - 1, bounds.Right - 12, bounds.Bottom - 1);
+            if (highContrast) {
+                using (var brush = new SolidBrush(SystemColors.Highlight))
+                    e.Graphics.FillRectangle(brush, outline);
+                main = secondary = SystemColors.HighlightText;
+            } else {
+                var graphicsState = e.Graphics.Save();
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                float border = Math.Max(1, ScalePixels(1, dpi));
+                var shapeBounds = RectangleF.Inflate(outline, -border / 2, -border / 2);
+                using (var shape = RoundedRectangle(shapeBounds, ScalePixels(8, dpi)))
+                using (var brush = new SolidBrush(SelectedBackground))
+                using (var pen = new Pen(Accent, border)) {
+                    e.Graphics.FillPath(brush, shape);
+                    e.Graphics.DrawPath(pen, shape);
+                }
+                e.Graphics.Restore(graphicsState);
+            }
+        } else if (e.Index + 1 < list.Items.Count) {
+            int inset = ScalePixels(12, dpi);
+            using (var pen = new Pen(highContrast ? SystemColors.WindowText : Separator))
+                e.Graphics.DrawLine(pen, e.Bounds.Left + inset, e.Bounds.Bottom - 1,
+                    e.Bounds.Right - inset, e.Bounds.Bottom - 1);
         }
-        var flags = TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding;
-        int top = bounds.Top + (bounds.Height - Font.Height - small.Height - 4) / 2;
-        var r = new Rectangle(bounds.Left + 13, top, Math.Max(1, bounds.Width - 26), Font.Height + 2);
-        TextRenderer.DrawText(e.Graphics, item.Name, Font, r, TextColor, flags | TextFormatFlags.EndEllipsis);
-        r.Y = r.Bottom + 1;
-        r.Height = small.Height + 2;
-        TextRenderer.DrawText(e.Graphics, Path.GetDirectoryName(item.PathName), small, r, HintColor,
+
+        int margin = ScalePixels(13, dpi), gap = ScalePixels(3, dpi);
+        var line = new Rectangle(e.Bounds.Left + margin,
+            e.Bounds.Top + (e.Bounds.Height - resultFont.Height - small.Height - gap) / 2,
+            Math.Max(0, e.Bounds.Width - 2 * margin), resultFont.Height);
+        const TextFormatFlags flags = TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding;
+        TextRenderer.DrawText(e.Graphics, item.Name, resultFont, line, main, flags | TextFormatFlags.EndEllipsis);
+        line.Y += line.Height + gap;
+        line.Height = small.Height;
+        TextRenderer.DrawText(e.Graphics, Path.GetDirectoryName(item.PathName), small, line, secondary,
             flags | TextFormatFlags.PathEllipsis);
+        if (list.Focused && (e.State & DrawItemState.Focus) != 0) {
+            outline.Inflate(-ScalePixels(3, dpi), -ScalePixels(3, dpi));
+            Color fill = selected ? highContrast ? SystemColors.Highlight : SelectedBackground : background;
+            ControlPaint.DrawFocusRectangle(e.Graphics, outline, main, fill);
+        }
     }
     void OpenSelected() {
         var item=list.SelectedItem as Entry;
         if(item==null) return;
         try {
-            if(!File.Exists(item.PathName)) { status.Text="Файл перемещён или недоступен"; return; }
-            Process.Start(new ProcessStartInfo(item.PathName){UseShellExecute=true});
+            const string unavailable = "Файл находится вне поддерживаемых локальных папок или недоступен";
+            FileAttributes attributes;
+            if (!Program.TryGetFixedFileAttributes(item.PathName, Program.GetFixedDrives(), out attributes)) {
+                SetStatus(unavailable);
+                return;
+            }
+            if ((attributes & FileAttributes.ReparsePoint) != 0 || ActiveExtensions.Contains(Path.GetExtension(item.PathName))) {
+                string prompt = "Windows может запустить программу или открыть другой ресурс через этот файл.\n\n"
+                    + item.PathName + "\n\nОткрыть файл?";
+                if (MessageBox.Show(this, prompt, "Подтверждение открытия файла", MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+                if (!Program.TryGetFixedFileAttributes(item.PathName, Program.GetFixedDrives(), out attributes)) {
+                    SetStatus(unavailable);
+                    return;
+                }
+            }
+            using (Process.Start(new ProcessStartInfo(item.PathName) { UseShellExecute = true })) {}
             Hide(); recent.Remember(item.PathName);
         } catch(Exception e) { MessageBox.Show(this,e.Message,"Не удалось открыть файл"); }
     }
@@ -502,8 +835,16 @@ sealed class Finder : Form {
         base.OnFormClosing(e);
     }
     protected override void Dispose(bool disposing) {
-        if(disposing) {closing=true; index.Stop(); refresh.Dispose(); tray.Dispose(); small.Dispose(); searchFont.Dispose(); if(appIcon!=null) appIcon.Dispose();}
+        if (disposing) {
+            closing = true;
+            if (pending != null) pending.Cancel();
+            index.Stop(); refresh.Dispose(); tray.Dispose();
+        }
         base.Dispose(disposing);
+        if (disposing) {
+            resultFont.Dispose(); searchFont.Dispose(); small.Dispose();
+            if (appIcon != null) appIcon.Dispose();
+        }
         if(packet!=IntPtr.Zero) {Marshal.FreeHGlobal(packet);packet=IntPtr.Zero;}
     }
 }
