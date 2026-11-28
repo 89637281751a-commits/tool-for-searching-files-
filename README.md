@@ -4,7 +4,7 @@
 
 ## Установка
 
-1. На странице [Releases](https://github.com/89637281751a-commits/tool-for-searching-files-/releases) откройте **Assets** и скачайте файл `QuickFind-<версия>.msi`.
+1. На странице [Releases](https://github.com/89637281751a-commits/tool-for-searching-files-/releases) откройте нужный выпуск и скачайте файл `QuickFind-<версия>.msi` по ссылке в его описании.
 2. Откройте MSI. После установки запустите **QuickFind** из меню **Пуск**.
 3. Чтобы запускать QuickFind при входе в Windows, включите эту настройку через значок программы рядом с часами.
 
